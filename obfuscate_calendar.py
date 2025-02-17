@@ -13,6 +13,8 @@ from google.auth.transport.requests import Request
 
 import constants
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 logging.getLogger("root").setLevel(logging.ERROR)
 
 # --- Global Constants and Configuration ---
@@ -216,7 +218,9 @@ def is_all_day_vevent(vevent):
 
 
 def fetch_icloud_events():
-    calendars_events = {}
+    """
+    Fetch iCloud events in parallel using a thread pool.
+    """
     principal = ICLOUD_CLIENT.principal()
     calendars = principal.calendars()
 
@@ -224,12 +228,16 @@ def fetch_icloud_events():
     future_date = now_utc + timedelta(days=31)
 
     print("Fetching iCloud events...")
-    for calendar in calendars:
+
+    calendars_events = {}
+
+    def fetch_single_calendar_events(calendar):
+        # Skip Reminders-based calendars or those on the skip list
         if calendar.name.startswith("Reminders"):
-            continue
+            return None
         if calendar.name in ICLOUD_CALENDARS_TO_SKIP:
             print(f"Skipping iCloud calendar: {calendar.name}")
-            continue
+            return None
 
         try:
             events = calendar.date_search(start=now_utc, end=future_date)
@@ -238,10 +246,22 @@ def fetch_icloud_events():
                 event.load()
                 props = event.get_properties([caldav.dav.GetEtag()])
                 event.etag = props.get("{DAV:}getetag", None)
-            calendars_events[calendar.name] = events
+            return (calendar.name, events)
         except Exception as e:
             print(f"Could not fetch events for calendar {calendar.name}: {e}")
-            continue
+            return None
+
+    # Use ThreadPoolExecutor to fetch events in parallel
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_calendar = {
+            executor.submit(fetch_single_calendar_events, calendar): calendar
+            for calendar in calendars
+        }
+        for future in as_completed(future_to_calendar):
+            result = future.result()
+            if result is not None:
+                calendar_name, events = result
+                calendars_events[calendar_name] = events
 
     return calendars_events
 
@@ -308,7 +328,7 @@ def main():
     creds = authenticate_google()
     service = build("calendar", "v3", credentials=creds)
 
-    # 2) Fetch iCloud events
+    # 2) Fetch iCloud events (now done in parallel)
     calendars_events = fetch_icloud_events()
 
     # 3) Create new Google calendar for obfuscated events
